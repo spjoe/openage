@@ -17,8 +17,9 @@ add_sources(libopenage
 	matrix.cpp
 	matrix_test.cpp
 	misc.cpp
-	opengl.cpp
 	profiler.cpp
+	quaternion.cpp
+	quaternion_test.cpp
 	stringformatter.cpp
 	strings.cpp
 	thread_id.cpp

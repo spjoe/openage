@@ -7,19 +7,21 @@
 #include <time.h>
 #include <epoxy/gl.h>
 #include <SDL2/SDL.h>
-#include <SDL2/SDL_image.h>
-
-#include "error/error.h"
-#include "log/log.h"
 
 #include "config.h"
+#include "error/error.h"
+#include "font.h"
 #include "game_main.h"
 #include "generator.h"
+#include "job/job_manager.h"
+#include "log/log.h"
 #include "texture.h"
 #include "util/color.h"
 #include "util/fps.h"
-#include "util/opengl.h"
 #include "util/strings.h"
+#include "renderer/renderer.h"
+#include "renderer/window.h"
+#include "screenshot.h"
 
 #include "renderer/text.h"
 #include "renderer/font/font.h"
@@ -92,87 +94,19 @@ Engine::Engine(util::Dir *data_dir, const char *windowtitle)
 	// register the engines input manager
 	this->register_input_action(&this->input_manager);
 
-	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-		throw Error(MSG(err) << "SDL video initialization: " << SDL_GetError());
-	} else {
-		log::log(MSG(info) << "Initialized SDL video subsystems.");
-	}
+	// create the graphical display
+	this->window = std::make_unique<renderer::Window>(windowtitle);
+	this->renderer = std::make_unique<renderer::Renderer>(this->window->get_context());
 
-	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-	SDL_GL_SetAttribute(SDL_GL_ACCELERATED_VISUAL, 1);
-	SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-
-	int32_t window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_MAXIMIZED;
-	this->window = SDL_CreateWindow(
-		windowtitle,
-		SDL_WINDOWPOS_CENTERED,
-		SDL_WINDOWPOS_CENTERED,
-		this->engine_coord_data->window_size.x,
-		this->engine_coord_data->window_size.y,
-		window_flags
-	);
-
-	if (this->window == nullptr) {
-		throw Error(MSG(err) << "Failed to create SDL window: " << SDL_GetError());
-	}
-
-	// load support for the PNG image formats, jpg bit: IMG_INIT_JPG
-	int wanted_image_formats = IMG_INIT_PNG;
-	int sdlimg_inited = IMG_Init(wanted_image_formats);
-	if ((sdlimg_inited & wanted_image_formats) != wanted_image_formats) {
-		throw Error(MSG(err) << "Failed to init PNG support: " << IMG_GetError());
-	}
-
-	this->glcontext = SDL_GL_CreateContext(this->window);
-
-	if (this->glcontext == nullptr) {
-		throw Error(MSG(err) << "Failed creating OpenGL context: " << SDL_GetError());
-	}
-
-	// check the OpenGL version, for shaders n stuff
-	if (!epoxy_is_desktop_gl() || epoxy_gl_version() < 21) {
-		throw Error(MSG(err) << "OpenGL 2.1 not available");
-	}
-
-	// to quote the standard doc:
-	// 'The value gives a rough estimate
-	// of the largest texture that the GL can handle'
-	// -> wat?
-	// anyways, we need at least 1024x1024.
-	int max_texture_size;
-	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);
-	log::log(MSG(dbg) << "Maximum supported texture size: " << max_texture_size);
-	if (max_texture_size < 1024) {
-		throw Error(MSG(err) << "Maximum supported texture size too small: " << max_texture_size);
-	}
-
-	int max_texture_units;
-	glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &max_texture_units);
-	log::log(MSG(dbg) << "Maximum supported texture units: " << max_texture_units);
-	if (max_texture_units < 2) {
-		throw Error(MSG(err) << "Your GPU has too less texture units: " << max_texture_units);
-	}
-
-	// vsync on
-	SDL_GL_SetSwapInterval(1);
-
-	// enable alpha blending
-	glEnable(GL_BLEND);
-
-	// order of drawing relevant for depth
-	// what gets drawn last is displayed on top.
-	glDisable(GL_DEPTH_TEST);
-
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	// renderer has to be notified of window size changes
+	this->register_resize_action(this->renderer.get());
 
 	// initialize job manager with cpucount-2 worker threads
 	int number_of_worker_threads = SDL_GetCPUCount() - 2;
 	if (number_of_worker_threads <= 0) {
 		number_of_worker_threads = 1;
 	}
-	this->job_manager = new job::JobManager{number_of_worker_threads};
+	this->job_manager = std::make_unique<job::JobManager>(number_of_worker_threads);
 
 	// initialize audio
 	auto devices = audio::AudioManager::get_devices();
@@ -189,7 +123,7 @@ Engine::Engine(util::Dir *data_dir, const char *windowtitle)
 		this->drawing_huds.value = !this->drawing_huds.value;
 	});
 	global_input_context.bind(input::action_t::SCREENSHOT, [this](const input::action_arg_t &) {
-		this->get_screenshot_manager().save_screenshot();
+		this->get_screenshot_manager()->save_screenshot();
 	});
 	global_input_context.bind(input::action_t::TOGGLE_DEBUG_OVERLAY, [this](const input::action_arg_t &) {
 		this->drawing_debug_overlay.value = !this->drawing_debug_overlay.value;
@@ -231,12 +165,6 @@ Engine::Engine(util::Dir *data_dir, const char *windowtitle)
 
 Engine::~Engine() {
 	this->profiler.unregister_all();
-
-	delete this->job_manager;
-	SDL_GL_DeleteContext(glcontext);
-	SDL_DestroyWindow(window);
-	IMG_Quit();
-	SDL_Quit();
 }
 
 bool Engine::on_resize(coord::window new_size) {
@@ -244,9 +172,6 @@ bool Engine::on_resize(coord::window new_size) {
 
 	// update engine window size
 	this->engine_coord_data->window_size = new_size;
-
-	// tell the screenshot manager about the new size
-	this->screenshot_manager.window_size = new_size;
 
 	// update camgame window position, set it to center.
 	this->engine_coord_data->camgame_window = this->engine_coord_data->window_size / 2;
@@ -257,9 +182,6 @@ bool Engine::on_resize(coord::window new_size) {
 	// reset previous projection matrix
 	glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
-
-	// update OpenGL viewport: the renderin area
-	glViewport(0, 0, this->engine_coord_data->window_size.x, this->engine_coord_data->window_size.y);
 
 	// set orthographic projection: left, right, bottom, top, near_val, far_val
 	glOrtho(0, this->engine_coord_data->window_size.x, 0, this->engine_coord_data->window_size.y, 9001, -1);
@@ -411,7 +333,7 @@ void Engine::loop() {
 		}
 		glPopMatrix();
 
-		util::gl_check_error();
+		this->renderer->check_error();
 
 		glPushMatrix(); {
 			// the hud coordinate system is automatically established
@@ -420,7 +342,6 @@ void Engine::loop() {
 
 			if (this->drawing_debug_overlay.value) {
 				this->draw_debug_overlay();
-
 			}
 
 			if (this->drawing_huds.value) {
@@ -436,7 +357,7 @@ void Engine::loop() {
 		}
 		glPopMatrix();
 
-		util::gl_check_error();
+		this->renderer->check_error();
 
 		this->profiler.end_measure("rendering");
 
@@ -444,8 +365,9 @@ void Engine::loop() {
 
 		// the rendering is done
 		// swap the drawing buffers to actually show the frame
-		SDL_GL_SwapWindow(window);
+		this->window->swap();
 
+		// vsync wait time is over.
 		this->profiler.end_measure("idle");
 		this->profiler.end_frame_measure();
 	}
@@ -488,15 +410,15 @@ Player *Engine::player_focus() const {
 }
 
 job::JobManager *Engine::get_job_manager() {
-	return this->job_manager;
+	return this->job_manager.get();
 }
 
 audio::AudioManager &Engine::get_audio_manager() {
 	return this->audio_manager;
 }
 
-ScreenshotManager &Engine::get_screenshot_manager() {
-	return this->screenshot_manager;
+ScreenshotManager *Engine::get_screenshot_manager() {
+	return this->screenshot_manager.get();
 }
 
 input::InputManager &Engine::get_input_manager() {
